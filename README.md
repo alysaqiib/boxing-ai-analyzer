@@ -50,6 +50,22 @@ cd boxing_ai_analyzer
    pip install -r requirements.txt
    ```
 
+   Always start Streamlit through the same Python environment where the
+   dependencies were installed:
+
+   ```powershell
+   python -m streamlit run src/app.py
+   ```
+
+   If Streamlit reports `Descriptors cannot be created directly`, the
+   environment has an old Streamlit installation paired with a newer protobuf.
+   From the project folder, repair it with:
+
+   ```powershell
+   python -m pip install --upgrade -r requirements.txt
+   python -m streamlit run src/app.py
+   ```
+
 ### 2. Local setup (CPU testing, slower but works for short clips)
 ```bash
 python -m venv venv
@@ -115,6 +131,48 @@ streamlit run src/app.py
 The app writes uploaded videos and generated results to `data/videos/` and
 `data/output/`. Those directories are kept in the repository with placeholder
 files, but their contents are not committed.
+
+The app groups analytics into configurable time-based rounds (3 minutes by
+default) and exports an additional `<name>_round_summary.csv` file. The CLI
+supports the same setting:
+
+```bash
+python src/run_pipeline.py --video data/videos/your_clip.mp4 --round_duration 180
+```
+
+The results page also includes interactive charts comparing punch volume,
+punch outcomes, punch types, accuracy by round, and landed target zones.
+It also provides an event review timeline: select a detected punch or
+defensive action to generate a two-second-before/two-second-after preview at
+half speed.
+Punches close together in time are grouped into combinations and exported as
+`<name>_combinations.csv`, including the punch sequence and landed/blocked/
+missed counts.
+Each strike also includes a transparent confidence estimate based on motion
+strength and resolution quality. The strike table is editable, allowing punch
+type, result, and target-zone corrections to be exported as
+`<name>_strikes_corrected.csv`. Saving corrections also rebuilds the derived
+summary, round-summary, combinations, performance, and summary-image files
+with a `_corrected` suffix, and refreshes the dashboard from those reports.
+Corrections do not rewrite the original annotated video.
+The pipeline also exports `<name>_performance.csv` with an explainable
+0-100 score, metric breakdown, and rule-based coaching feedback. It is a
+training summary, not medical advice or an official judging score.
+
+Strike detection also applies a minimum speed and arm-extension gate so
+unrelated body motion, including leg movement, is less likely to be reported
+as a punch. Events where the opponent cannot be resolved are excluded from
+the user-facing punch totals rather than being reported as hits. The focused
+regression tests can be run with:
+
+```powershell
+python -m unittest src/test_strike_classifier.py -v
+```
+
+Punch speed is normalized by the video's FPS, so the same movement is treated
+consistently in 24, 30, and 60 FPS footage. The threshold is learned from the
+video's motion distribution with only broad safety bounds, rather than one
+fixed punch-speed cutoff.
 
 ---
 

@@ -169,18 +169,194 @@ def build_stats_card(strikes_by_identity: dict, identity_stats: dict, footwork_b
     return card
 
 
-def save_strikes_csv(strikes_by_identity: dict, out_path: str, fps: float):
+def _round_number(frame_idx: int, fps: float, round_duration_seconds: float) -> int:
+    """Return a one-based round number for a frame using fixed time windows."""
+    return int(frame_idx / (fps * round_duration_seconds)) + 1
+
+
+def save_strikes_csv(strikes_by_identity: dict, out_path: str, fps: float,
+                     round_duration_seconds: float):
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["fighter", "frame", "time_seconds", "side", "punch_type",
-                          "speed_score", "result", "target_zone"])
+        writer.writerow(["round", "fighter", "frame", "time_seconds", "side", "punch_type",
+                          "speed_score", "confidence_percent", "result", "target_zone"])
         for identity, strikes in strikes_by_identity.items():
             for s in strikes:
                 writer.writerow([
+                    _round_number(s["frame_idx"], fps, round_duration_seconds),
                     f"Fighter {identity}", s["frame_idx"], round(s["frame_idx"] / fps, 2),
-                    s["side"], s["punch_type"], s["speed"],
+                    s["side"], s["punch_type"], s["speed"], s.get("confidence_percent", 0),
                     s.get("result", "Unknown"), s.get("target_zone") or "",
                 ])
+
+
+def add_strike_confidence_scores(strikes_by_identity: dict, speed_threshold: float) -> dict:
+    """Add a transparent 0-100 confidence estimate to each detected strike."""
+    if speed_threshold <= 0:
+        raise ValueError("speed_threshold must be greater than zero")
+
+    scored = {}
+    for identity, strikes in strikes_by_identity.items():
+        scored[identity] = []
+        for strike in strikes:
+            speed_ratio = min(float(strike.get("speed", 0.0)) / speed_threshold, 2.0)
+            motion_score = min(speed_ratio / 2.0, 1.0)
+            result_score = 0.65 if strike.get("result") == "Unknown" else 1.0
+            confidence = round(100 * motion_score * result_score)
+            enriched = dict(strike)
+            enriched["confidence_percent"] = confidence
+            scored[identity].append(enriched)
+    return scored
+
+
+def filter_unresolved_strikes(strikes_by_identity: dict) -> dict:
+    """Keep only strikes whose outcome could be resolved against the opponent."""
+    return {
+        identity: [
+            strike for strike in strikes
+            if strike.get("result") in {"Landed", "Blocked", "Missed"}
+        ]
+        for identity, strikes in strikes_by_identity.items()
+    }
+
+
+def build_round_summary(strikes_by_identity: dict, defensive_by_identity: dict,
+                        footwork_by_identity: dict, frame_series_by_identity: dict,
+                        fps: float, total_frames: int,
+                        round_duration_seconds: float) -> list:
+    """Build one comparable analytics row per fighter and time-based round."""
+    if round_duration_seconds <= 0:
+        raise ValueError("round_duration_seconds must be greater than zero")
+
+    total_rounds = max(1, _round_number(max(total_frames - 1, 0), fps, round_duration_seconds))
+    rows = []
+    for round_number in range(1, total_rounds + 1):
+        start_frame = int((round_number - 1) * fps * round_duration_seconds)
+        end_frame = min(int(round_number * fps * round_duration_seconds) - 1, max(total_frames - 1, 0))
+        for identity in sorted(set(strikes_by_identity) | set(frame_series_by_identity)):
+            strikes = [
+                s for s in strikes_by_identity.get(identity, [])
+                if start_frame <= s["frame_idx"] <= end_frame
+            ]
+            type_counts = defaultdict(int)
+            result_counts = defaultdict(int)
+            zone_counts = defaultdict(int)
+            for strike in strikes:
+                type_counts[strike["punch_type"]] += 1
+                result_counts[strike.get("result", "Unknown")] += 1
+                if strike.get("target_zone"):
+                    zone_counts[strike["target_zone"]] += 1
+
+            defense = defensive_by_identity.get(identity, {})
+            guard_periods = [
+                period for period in defense.get("guard_periods", [])
+                if period["end_frame"] >= start_frame and period["start_frame"] <= end_frame
+            ]
+            duck_slip_events = [
+                event for event in defense.get("duck_slip_events", [])
+                if start_frame <= event["frame_idx"] <= end_frame
+            ]
+            frame_series = {
+                frame: data for frame, data in frame_series_by_identity.get(identity, {}).items()
+                if start_frame <= frame <= end_frame
+            }
+            footwork = analyze_footwork({identity: frame_series}).get(
+                identity, {"distance_covered": 0, "dominant_stance": "unknown"}
+            )
+            total_strikes = len(strikes)
+            landed = result_counts.get("Landed", 0)
+            rows.append({
+                "round": round_number,
+                "fighter": f"Fighter {identity}",
+                "start_time_seconds": round(start_frame / fps, 2),
+                "end_time_seconds": round((end_frame + 1) / fps, 2),
+                "total_strikes": total_strikes,
+                "jab_cross": type_counts.get("Jab/Cross", 0),
+                "hook": type_counts.get("Hook", 0),
+                "uppercut": type_counts.get("Uppercut", 0),
+                "landed": landed,
+                "blocked": result_counts.get("Blocked", 0),
+                "missed": result_counts.get("Missed", 0),
+                "unknown": result_counts.get("Unknown", 0),
+                "accuracy_percent": round(100 * landed / total_strikes, 1) if total_strikes else 0.0,
+                "head_targets": zone_counts.get("Head", 0),
+                "body_targets": zone_counts.get("Body", 0),
+                "leg_targets": zone_counts.get("Leg", 0),
+                "guard_periods": len(guard_periods),
+                "duck_slip_events": len(duck_slip_events),
+                "distance_covered_relative_units": footwork["distance_covered"],
+                "dominant_stance": footwork["dominant_stance"],
+                "frames_tracked": len(frame_series),
+            })
+    return rows
+
+
+def save_round_summary_csv(round_summary: list, out_path: str):
+    """Save round-by-round analytics in a spreadsheet-friendly format."""
+    fields = [
+        "round", "fighter", "start_time_seconds", "end_time_seconds",
+        "total_strikes", "jab_cross", "hook", "uppercut", "landed", "blocked",
+        "missed", "unknown", "accuracy_percent", "head_targets", "body_targets",
+        "leg_targets", "guard_periods", "duck_slip_events",
+        "distance_covered_relative_units", "dominant_stance", "frames_tracked",
+    ]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(round_summary)
+
+
+def build_combinations(strikes_by_identity: dict, fps: float,
+                       max_gap_seconds: float = 0.75) -> list:
+    """Group nearby strikes from each fighter into two-or-more-punch combinations."""
+    if fps <= 0 or max_gap_seconds <= 0:
+        raise ValueError("fps and max_gap_seconds must be greater than zero")
+
+    max_gap_frames = max(1, int(fps * max_gap_seconds))
+    combinations = []
+    for identity, strikes in strikes_by_identity.items():
+        ordered = sorted(strikes, key=lambda strike: strike["frame_idx"])
+        current = []
+        for strike in ordered:
+            if current and strike["frame_idx"] - current[-1]["frame_idx"] > max_gap_frames:
+                if len(current) >= 2:
+                    combinations.append(_format_combination(identity, current, fps))
+                current = []
+            current.append(strike)
+        if len(current) >= 2:
+            combinations.append(_format_combination(identity, current, fps))
+    return sorted(combinations, key=lambda combo: combo["start_frame"])
+
+
+def _format_combination(identity: str, strikes: list, fps: float) -> dict:
+    result_counts = defaultdict(int)
+    for strike in strikes:
+        result_counts[strike.get("result", "Unknown")] += 1
+    return {
+        "fighter": f"Fighter {identity}",
+        "start_frame": strikes[0]["frame_idx"],
+        "end_frame": strikes[-1]["frame_idx"],
+        "start_time_seconds": round(strikes[0]["frame_idx"] / fps, 2),
+        "end_time_seconds": round(strikes[-1]["frame_idx"] / fps, 2),
+        "punch_count": len(strikes),
+        "sequence": " -> ".join(strike["punch_type"] for strike in strikes),
+        "landed": result_counts.get("Landed", 0),
+        "blocked": result_counts.get("Blocked", 0),
+        "missed": result_counts.get("Missed", 0),
+        "unknown": result_counts.get("Unknown", 0),
+    }
+
+
+def save_combinations_csv(combinations: list, out_path: str):
+    fields = [
+        "fighter", "start_frame", "end_frame", "start_time_seconds",
+        "end_time_seconds", "punch_count", "sequence", "landed", "blocked",
+        "missed", "unknown",
+    ]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(combinations)
 
 
 def save_summary_csv(strikes_by_identity: dict, identity_stats: dict, defensive_by_identity: dict,
@@ -189,6 +365,7 @@ def save_summary_csv(strikes_by_identity: dict, identity_stats: dict, defensive_
         writer = csv.writer(f)
         writer.writerow(["fighter", "total_strikes", "jab_cross", "hook", "uppercut",
                           "landed", "blocked", "missed",
+                          "accuracy_percent", "head_targets", "body_targets", "leg_targets",
                           "guard_periods", "duck_slip_events",
                           "distance_covered_relative_units", "dominant_stance",
                           "frames_tracked", "glove_confirmation_rate"])
@@ -198,24 +375,180 @@ def save_summary_csv(strikes_by_identity: dict, identity_stats: dict, defensive_
             for s in strikes:
                 type_counts[s["punch_type"]] += 1
                 result_counts[s.get("result", "Unknown")] += 1
+            target_counts = defaultdict(int)
+            for strike in strikes:
+                if strike.get("target_zone"):
+                    target_counts[strike["target_zone"]] += 1
             stats = identity_stats.get(identity, {})
             defense = defensive_by_identity.get(identity, {"guard_periods": [], "duck_slip_events": []})
             footwork = footwork_by_identity.get(identity, {"distance_covered": 0, "dominant_stance": "unknown"})
+            landed = result_counts.get("Landed", 0)
             writer.writerow([
                 f"Fighter {identity}", len(strikes),
                 type_counts.get("Jab/Cross", 0), type_counts.get("Hook", 0), type_counts.get("Uppercut", 0),
-                result_counts.get("Landed", 0), result_counts.get("Blocked", 0), result_counts.get("Missed", 0),
+                landed, result_counts.get("Blocked", 0), result_counts.get("Missed", 0),
+                round(100 * landed / len(strikes), 1) if strikes else 0.0,
+                target_counts.get("Head", 0), target_counts.get("Body", 0), target_counts.get("Leg", 0),
                 len(defense["guard_periods"]), len(defense["duck_slip_events"]),
                 footwork["distance_covered"], footwork["dominant_stance"],
                 stats.get("frames_seen", 0), round(stats.get("confirmation_rate", 0.0), 3),
             ])
 
 
+def calculate_performance_scores(strikes_by_identity: dict, defensive_by_identity: dict,
+                                 footwork_by_identity: dict, identity_stats: dict) -> list:
+    """Return explainable 0-100 scores and coaching feedback per fighter."""
+    totals = {
+        identity: len(strikes)
+        for identity, strikes in strikes_by_identity.items()
+    }
+    max_total = max(max(totals.values(), default=0), 1)
+    rows = []
+    for identity in sorted(set(strikes_by_identity) | set(identity_stats)):
+        strikes = strikes_by_identity.get(identity, [])
+        result_counts = defaultdict(int)
+        for strike in strikes:
+            result_counts[strike.get("result", "Unknown")] += 1
+        total = len(strikes)
+        landed = result_counts["Landed"]
+        accuracy = 100 * landed / total if total else 0.0
+        activity = 100 * totals.get(identity, 0) / max_total
+        defense = defensive_by_identity.get(identity, {})
+        defensive_events = len(defense.get("duck_slip_events", []))
+        guard_periods = len(defense.get("guard_periods", []))
+        defensive_activity = min(100.0, defensive_events * 10.0 + guard_periods * 15.0)
+        footwork = footwork_by_identity.get(identity, {})
+        movement = min(100.0, float(footwork.get("distance_covered", 0.0)) * 10.0)
+        confirmation = 100 * float(identity_stats.get(identity, {}).get("confirmation_rate", 0.0))
+        score = round(
+            accuracy * 0.30
+            + activity * 0.25
+            + defensive_activity * 0.20
+            + movement * 0.15
+            + confirmation * 0.10
+        )
+        feedback = []
+        if accuracy < 35:
+            feedback.append("Prioritize accuracy over throwing volume.")
+        elif accuracy >= 60:
+            feedback.append("Maintain the current punch accuracy.")
+        if activity < 50:
+            feedback.append("Increase controlled punch activity.")
+        if defensive_activity < 30:
+            feedback.append("Work on guard, slips, and ducks after exchanges.")
+        if movement < 35:
+            feedback.append("Add more purposeful footwork and exits.")
+        if not feedback:
+            feedback.append("Balanced performance across the measured categories.")
+        rows.append({
+            "fighter": f"Fighter {identity}",
+            "overall_score": score,
+            "accuracy_score": round(accuracy, 1),
+            "activity_score": round(activity, 1),
+            "defensive_activity_score": round(defensive_activity, 1),
+            "movement_score": round(movement, 1),
+            "tracking_confidence_score": round(confirmation, 1),
+            "coaching_feedback": " ".join(feedback),
+        })
+    return rows
+
+
+def save_performance_scores_csv(scores: list, out_path: str):
+    fields = [
+        "fighter", "overall_score", "accuracy_score", "activity_score",
+        "defensive_activity_score", "movement_score", "tracking_confidence_score",
+        "coaching_feedback",
+    ]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(scores)
+
+
+def rebuild_corrected_reports(corrected_rows: list, result: dict, out_dir: str,
+                              stem: str, round_duration_seconds: float) -> dict:
+    """Rebuild derived reports after manual strike-field corrections.
+
+    The detector output and annotated video remain untouched. Only fields
+    supplied by the editable strike table are used to recalculate reports.
+    """
+    corrected_by_identity = defaultdict(list)
+    for row in corrected_rows:
+        fighter = str(row.get("fighter", ""))
+        identity = fighter.replace("Fighter ", "", 1).strip()
+        if identity not in {"A", "B"}:
+            raise ValueError(f"Invalid fighter value in corrected strike data: {fighter!r}")
+        try:
+            frame_idx = int(row["frame"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("Corrected strike data contains an invalid frame.") from error
+        target_zone = str(row.get("target_zone", "") or "").strip() or None
+        corrected_by_identity[identity].append({
+            "frame_idx": frame_idx,
+            "side": str(row.get("side", "")),
+            "punch_type": str(row.get("punch_type", "Jab/Cross")),
+            "speed": float(row.get("speed_score", 0.0)),
+            "confidence_percent": float(row.get("confidence_percent", 0.0)),
+            "result": str(row.get("result", "Unknown")),
+            "target_zone": target_zone,
+        })
+
+    out_path = Path(out_dir)
+    corrected_strikes_csv = str(out_path / f"{stem}_strikes_corrected.csv")
+    corrected_summary_csv = str(out_path / f"{stem}_summary_corrected.csv")
+    corrected_round_csv = str(out_path / f"{stem}_round_summary_corrected.csv")
+    corrected_combinations_csv = str(out_path / f"{stem}_combinations_corrected.csv")
+    corrected_performance_csv = str(out_path / f"{stem}_performance_corrected.csv")
+    corrected_summary_png = str(out_path / f"{stem}_summary_corrected.png")
+
+    fps = float(result["fps"])
+    save_strikes_csv(
+        corrected_by_identity, corrected_strikes_csv, fps, round_duration_seconds
+    )
+    save_summary_csv(
+        corrected_by_identity, result["identity_stats"],
+        result["defensive_by_identity"], result["footwork_by_identity"],
+        corrected_summary_csv,
+    )
+    round_summary = build_round_summary(
+        corrected_by_identity, result["defensive_by_identity"],
+        result["footwork_by_identity"], result["frame_series_by_identity"],
+        fps, result["total_frames"], round_duration_seconds,
+    )
+    save_round_summary_csv(round_summary, corrected_round_csv)
+    combinations = build_combinations(corrected_by_identity, fps)
+    save_combinations_csv(combinations, corrected_combinations_csv)
+    performance_scores = calculate_performance_scores(
+        corrected_by_identity, result["defensive_by_identity"],
+        result["footwork_by_identity"], result["identity_stats"],
+    )
+    save_performance_scores_csv(performance_scores, corrected_performance_csv)
+    summary_card = build_stats_card(
+        corrected_by_identity, result["identity_stats"],
+        result["footwork_by_identity"], result["video_width"], result["video_height"],
+    )
+    cv2.imwrite(corrected_summary_png, summary_card)
+
+    return {
+        "strikes_csv": corrected_strikes_csv,
+        "summary_csv": corrected_summary_csv,
+        "summary_png": corrected_summary_png,
+        "round_summary_csv": corrected_round_csv,
+        "round_summary": round_summary,
+        "combinations_csv": corrected_combinations_csv,
+        "combinations": combinations,
+        "performance_csv": corrected_performance_csv,
+        "performance_scores": performance_scores,
+        "strikes_by_identity": dict(corrected_by_identity),
+    }
+
+
 def run_full_pipeline(video_path, out_dir="data/output",
                        pose_model="yolov8n-pose.pt",
                        glove_model="models/glove_detector/weights/best.pt",
                        progress_callback=None,
-                       show_live_panel=False):
+                       show_live_panel=False,
+                       round_duration_seconds=180.0):
     """
     Runs the entire pipeline on one video and returns a dict of output paths.
 
@@ -246,19 +579,29 @@ def run_full_pipeline(video_path, out_dir="data/output",
     signatures = compute_appearance_signatures(str(video_path), history)
     track_id_to_identity, identity_stats = cluster_into_two_identities(per_id_stats, signatures)
 
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
     report(3, TOTAL_STEPS, "[3/6] Strike detection, resolution, defense, footwork...")
     frame_series_by_identity = build_identity_frame_series(history, track_id_to_identity)
 
-    adaptive_threshold = compute_adaptive_speed_threshold(frame_series_by_identity)
-    report(3, TOTAL_STEPS, f"    Auto-calculated speed threshold for this video: {adaptive_threshold:.3f}")
+    adaptive_threshold = compute_adaptive_speed_threshold(frame_series_by_identity, fps=fps)
+    report(3, TOTAL_STEPS, f"    Auto-calculated speed threshold: {adaptive_threshold:.3f}/s at {fps:.2f} FPS")
 
     strikes_by_identity = {
-        identity: detect_strikes_for_identity(fs, speed_threshold=adaptive_threshold)
+        identity: detect_strikes_for_identity(fs, speed_threshold=adaptive_threshold, fps=fps)
         for identity, fs in frame_series_by_identity.items()
     }
     strikes_by_identity = resolve_all_strikes(strikes_by_identity, history, track_id_to_identity)
+    strikes_by_identity = add_strike_confidence_scores(strikes_by_identity, adaptive_threshold)
+    strikes_by_identity = filter_unresolved_strikes(strikes_by_identity)
     defensive_by_identity = analyze_defensive_actions(frame_series_by_identity)
     footwork_by_identity = analyze_footwork(frame_series_by_identity)
+    if round_duration_seconds <= 0:
+        raise ValueError("round_duration_seconds must be greater than zero")
 
     summary_log = []
     for identity, strikes in strikes_by_identity.items():
@@ -270,12 +613,6 @@ def run_full_pipeline(video_path, out_dir="data/output",
         summary_log.append(f"Fighter {identity}: {len(strikes)} strikes "
                             f"({dict(type_counts)}) -- {dict(result_counts)}")
     report(4, TOTAL_STEPS, "\n".join(summary_log))
-
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
 
     report(5, TOTAL_STEPS, "[5/6] Rendering annotated video + stats card outro...")
     video_out_path = str(out_dir / f"{stem}_analysis.mp4")
@@ -359,9 +696,23 @@ def run_full_pipeline(video_path, out_dir="data/output",
     summary_csv_path = str(out_dir / f"{stem}_summary.csv")
     summary_png_path = str(out_dir / f"{stem}_summary.png")
 
-    save_strikes_csv(strikes_by_identity, strikes_csv_path, fps)
+    save_strikes_csv(strikes_by_identity, strikes_csv_path, fps, round_duration_seconds)
     save_summary_csv(strikes_by_identity, identity_stats, defensive_by_identity,
                       footwork_by_identity, summary_csv_path)
+    round_summary = build_round_summary(
+        strikes_by_identity, defensive_by_identity, footwork_by_identity,
+        frame_series_by_identity, fps, len(history), round_duration_seconds,
+    )
+    round_summary_csv_path = str(out_dir / f"{stem}_round_summary.csv")
+    save_round_summary_csv(round_summary, round_summary_csv_path)
+    combinations = build_combinations(strikes_by_identity, fps)
+    combinations_csv_path = str(out_dir / f"{stem}_combinations.csv")
+    save_combinations_csv(combinations, combinations_csv_path)
+    performance_scores = calculate_performance_scores(
+        strikes_by_identity, defensive_by_identity, footwork_by_identity, identity_stats
+    )
+    performance_csv_path = str(out_dir / f"{stem}_performance.csv")
+    save_performance_scores_csv(performance_scores, performance_csv_path)
     cv2.imwrite(summary_png_path, stats_card)
 
     return {
@@ -369,10 +720,21 @@ def run_full_pipeline(video_path, out_dir="data/output",
         "strikes_csv": strikes_csv_path,
         "summary_csv": summary_csv_path,
         "summary_png": summary_png_path,
+        "round_summary_csv": round_summary_csv_path,
+        "round_summary": round_summary,
+        "combinations_csv": combinations_csv_path,
+        "combinations": combinations,
+        "performance_csv": performance_csv_path,
+        "performance_scores": performance_scores,
+        "fps": fps,
         "strikes_by_identity": strikes_by_identity,
         "identity_stats": identity_stats,
         "defensive_by_identity": defensive_by_identity,
         "footwork_by_identity": footwork_by_identity,
+        "frame_series_by_identity": frame_series_by_identity,
+        "total_frames": len(history),
+        "video_width": width,
+        "video_height": height,
     }
 
 
@@ -386,13 +748,19 @@ if __name__ == "__main__":
     parser.add_argument("--glove_model", default="models/glove_detector/weights/best.pt")
     parser.add_argument("--live_panel", action="store_true",
                          help="Add a broadcast-style side panel (hit zones, position map, activity graph)")
+    parser.add_argument("--round_duration", type=float, default=180.0,
+                        help="Length of each analytics round in seconds (default: 180)")
     args = parser.parse_args()
 
     result = run_full_pipeline(args.video, args.out_dir, args.pose_model, args.glove_model,
-                                show_live_panel=args.live_panel)
+                                show_live_panel=args.live_panel,
+                                round_duration_seconds=args.round_duration)
 
     print(f"\nDone. Outputs in {args.out_dir}/:")
     print(f"  {Path(result['video']).name}")
     print(f"  {Path(result['strikes_csv']).name}")
     print(f"  {Path(result['summary_csv']).name}")
+    print(f"  {Path(result['round_summary_csv']).name}")
+    print(f"  {Path(result['combinations_csv']).name}")
+    print(f"  {Path(result['performance_csv']).name}")
     print(f"  {Path(result['summary_png']).name}")

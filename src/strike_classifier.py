@@ -47,9 +47,15 @@ LEFT_WRIST, RIGHT_WRIST = 9, 10
 KEYPOINT_CONF_THRESHOLD = 0.3
 
 # Tune these against your own footage -- defaults are a starting point.
-SPEED_THRESHOLD = 0.35       # normalized wrist speed (relative to bbox diagonal) to count as a strike
-                              # (tuned from real footage: 95th-percentile normal movement was ~0.12-0.25)
+SPEED_THRESHOLD = 0.35       # fallback normalized wrist speed per second
+MIN_ADAPTIVE_SPEED = 0.12    # safety floor for unusual/very short clips
+MAX_ADAPTIVE_SPEED = 10.0    # broad safety ceiling; threshold remains video-dependent
+MIN_ARM_EXTENSION_GAIN = 0.10  # wrist-to-shoulder distance increase, normalized by bbox diagonal
+MIN_WRIST_SHOULDER_DISTANCE = 0.20  # minimum extended-arm distance at the candidate peak
+MIN_ELBOW_MOTION = 0.04      # require the elbow to move with the wrist, rejecting keypoint jumps
+MIN_RELATIVE_ARM_MOTION = 0.12  # wrist must move relative to the shoulder, not with the whole body
 MIN_GAP_FRAMES = 5           # minimum frames between two separate strikes (same wrist)
+MIN_CROSS_WRIST_GAP_FRAMES = 3  # two hands cannot produce separate punches in adjacent frames
 STRIKE_WINDOW = 4            # frames to look back from the peak, for displacement/angle measurement
 LABEL_DISPLAY_FRAMES = 8     # how many frames to keep a strike label visible after detection
 
@@ -79,8 +85,10 @@ def build_identity_frame_series(history: list, track_id_to_identity: dict) -> di
     return series
 
 
-def _wrist_speed_series(frame_series: dict, wrist_idx: int) -> list:
-    """Returns [(frame_idx, normalized_speed), ...] for one wrist across the clip."""
+def _wrist_speed_series(frame_series: dict, wrist_idx: int, fps: float = 30.0) -> list:
+    """Return normalized wrist speed per second, independent of source FPS."""
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
     frame_indices = sorted(frame_series.keys())
     speeds = []
     prev_frame_idx, prev_pos = None, None
@@ -98,14 +106,16 @@ def _wrist_speed_series(frame_series: dict, wrist_idx: int) -> list:
             if gap > 0:
                 dist = np.linalg.norm(pos - prev_pos)
                 diag = _bbox_diag(frame_series[fi]["bbox"])
-                speeds.append((fi, (dist / diag) / gap))
+                speeds.append((fi, (dist / diag) * fps / gap))
         prev_frame_idx, prev_pos = fi, pos
 
     return speeds
 
 
 def compute_adaptive_speed_threshold(frame_series_by_identity: dict, percentile: float = 92,
-                                      min_threshold: float = 0.15, max_threshold: float = 0.6) -> float:
+                                      min_threshold: float = MIN_ADAPTIVE_SPEED,
+                                      max_threshold: float = MAX_ADAPTIVE_SPEED,
+                                      fps: float = 30.0) -> float:
     """
     Automatically picks a SPEED_THRESHOLD based on THIS video's own movement data,
     instead of using one fixed number for every video. Different videos have very
@@ -119,16 +129,19 @@ def compute_adaptive_speed_threshold(frame_series_by_identity: dict, percentile:
     all_speeds = []
     for identity, frame_series in frame_series_by_identity.items():
         for wrist_idx in [LEFT_WRIST, RIGHT_WRIST]:
-            all_speeds.extend(speed for _, speed in _wrist_speed_series(frame_series, wrist_idx))
+            all_speeds.extend(
+                speed for _, speed in _wrist_speed_series(frame_series, wrist_idx, fps=fps)
+            )
 
     if not all_speeds:
         return SPEED_THRESHOLD  # fallback to the default constant if no data at all
 
     threshold = float(np.percentile(all_speeds, percentile))
-    return float(np.clip(threshold, min_threshold, max_threshold))
+    return float(np.clip(threshold, max(min_threshold, MIN_ADAPTIVE_SPEED), max_threshold))
 
 
-def detect_strikes_for_identity(frame_series: dict, speed_threshold: float = None) -> list:
+def detect_strikes_for_identity(frame_series: dict, speed_threshold: float = None,
+                                fps: float = 30.0) -> list:
     """
     frame_series: {frame_idx: fighter_entry} for ONE identity, sorted implicitly by frame_idx.
     speed_threshold: if None, falls back to the module-level SPEED_THRESHOLD constant
@@ -136,6 +149,8 @@ def detect_strikes_for_identity(frame_series: dict, speed_threshold: float = Non
                       a value from compute_adaptive_speed_threshold() instead.
     Returns a list of detected strikes: {frame_idx, side, punch_type, speed}.
     """
+    if fps <= 0:
+        raise ValueError("fps must be greater than zero")
     if speed_threshold is None:
         speed_threshold = SPEED_THRESHOLD
 
@@ -146,7 +161,7 @@ def detect_strikes_for_identity(frame_series: dict, speed_threshold: float = Non
         ("left", LEFT_WRIST, LEFT_ELBOW, LEFT_SHOULDER),
         ("right", RIGHT_WRIST, RIGHT_ELBOW, RIGHT_SHOULDER),
     ]:
-        speeds = _wrist_speed_series(frame_series, wrist_idx)
+        speeds = _wrist_speed_series(frame_series, wrist_idx, fps=fps)
         positions = {}
         for fi in frame_indices:
             kpts = frame_series[fi]["keypoints"]
@@ -162,7 +177,15 @@ def detect_strikes_for_identity(frame_series: dict, speed_threshold: float = Non
             next_spd = speeds[i + 1][1]
 
             is_local_peak = spd >= prev_spd and spd >= next_spd
-            if is_local_peak and spd >= speed_threshold and (fi - last_strike_frame) >= MIN_GAP_FRAMES:
+            if (
+                is_local_peak
+                and spd >= float(speed_threshold)
+                and (fi - last_strike_frame) >= MIN_GAP_FRAMES
+                and all(
+                    abs(fi - previous["frame_idx"]) >= MIN_CROSS_WRIST_GAP_FRAMES
+                    for previous in strikes
+                )
+            ):
                 # Classify using displacement + elbow angle
                 start_fi = max(fi - STRIKE_WINDOW, frame_indices[0])
                 if start_fi not in positions or fi not in positions:
@@ -174,7 +197,29 @@ def detect_strikes_for_identity(frame_series: dict, speed_threshold: float = Non
                 vertical_disp = start_pos[1] - peak_pos[1]     # positive = moved up (image y grows downward)
                 horizontal_disp = peak_pos[0] - start_pos[0]
 
+                start_kpts = frame_series[start_fi]["keypoints"]
                 kpts = frame_series[fi]["keypoints"]
+                required_indices = [shoulder_idx, elbow_idx, wrist_idx]
+                if any(kpts[index][2] < KEYPOINT_CONF_THRESHOLD for index in required_indices):
+                    continue
+                bbox_diag = _bbox_diag(frame_series[fi]["bbox"])
+                start_arm_length = np.linalg.norm(start_pos - start_kpts[shoulder_idx][:2]) / bbox_diag
+                peak_arm_length = np.linalg.norm(peak_pos - kpts[shoulder_idx][:2]) / bbox_diag
+                elbow_motion = (
+                    np.linalg.norm(kpts[elbow_idx][:2] - start_kpts[elbow_idx][:2])
+                    / bbox_diag
+                )
+                relative_arm_motion = np.linalg.norm(
+                    (peak_pos - start_pos)
+                    - (kpts[shoulder_idx][:2] - start_kpts[shoulder_idx][:2])
+                ) / bbox_diag
+                if (
+                    peak_arm_length < MIN_WRIST_SHOULDER_DISTANCE
+                    or peak_arm_length - start_arm_length < MIN_ARM_EXTENSION_GAIN
+                    or elbow_motion < MIN_ELBOW_MOTION
+                    or relative_arm_motion < MIN_RELATIVE_ARM_MOTION
+                ):
+                    continue
                 shoulder = kpts[shoulder_idx][:2]
                 elbow = kpts[elbow_idx][:2]
                 wrist = kpts[wrist_idx][:2]
