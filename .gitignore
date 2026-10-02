@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Jupyter and editor files
+.ipynb_checkpoints/
+.vscode/*
+!.vscode/settings.json
+.idea/
+
+# Local videos and generated analysis output
+data/videos/*
+!data/videos/.gitkeep
+data/output/*
+!data/output/.gitkeep
+
+# Local dataset files and generated training runs
+data/dataset/*
+!data/dataset/README*.txt
+!data/dataset/data.yaml
+data/dataset/**/labels.cache
+runs/
+models/*
+
+# Model caches and downloaded weights
+*.pt
+*.onnx
+
+# Operating-system files
+.DS_Store
+Thumbs.db
